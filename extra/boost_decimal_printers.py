@@ -186,6 +186,60 @@ class BoostDecimalPrinter:
             unbiased_exponent = BoostDecimalHelpers.unbiased_exponent(self.val["bits_"], self.bit_width)
         return unbiased_exponent - BoostDecimalHelpers.bias(self.bit_width)
 
+    def to_chars_fixed_impl(self) -> str:
+        out : str = "-" if self.isneg() else ""
+
+        significand = int(self.significand())
+        exponent = int(self.exponent())
+
+        if significand == 0 and exponent == 0:
+            return f"{out}0.0e+00"
+
+        # `boost::decimal::frexp10()` and `boost::decimal::detail::normalize`
+        target_precision = BoostDecimalHelpers.precision(self.bit_width)
+        significand_digits = len(str(significand))
+        if significand_digits < target_precision:
+            zeros_needed = target_precision - significand_digits
+            significand *= 10**zeros_needed
+            exponent -= zeros_needed
+        elif significand_digits > target_precision:
+            excess_digits = significand_digits - (target_precision + 1)
+            significand //= 10**excess_digits
+            def fenv_round(val):
+                trailing_num = val % 10
+                exp_delta : int = 0
+                val //= 10
+                exp_delta += 1
+                if trailing_num >= 5:
+                    val += 1
+                if val > BoostDecimalHelpers.max_significand(self.bit_width, self.is_fast):
+                    val //= 10
+                    exp_delta += 1
+                return exp_delta
+            exponent += fenv_round(significand) + excess_digits
+
+        significand_str = str(significand)
+        real_precision = BoostDecimalHelpers.precision(self.bit_width)
+
+        integer_digits : int = len(significand_str) + exponent
+        num_dig : int = -exponent
+
+        # Trim trailing zeros
+        while significand % 10 == 0:
+            significand = significand // 10
+            exponent = exponent + 1
+            num_dig = num_dig - 1
+
+        significand_str = str(significand)
+        out += significand_str
+
+        if exponent < 0:
+            out = out[:exponent] + "." + out[exponent:]
+        elif exponent >= 1:
+            out += ("0" * exponent)
+
+        return out
+
     def to_chars_scientific_impl(self) -> str:
         out : str = "-" if self.isneg() else ""
 
@@ -235,9 +289,34 @@ class BoostDecimalPrinter:
         out += str(abs_exp)
 
         return out
+    
+    def within_fractional_value(self) -> bool:
+        """
+        The number must satisfy `x >= 1 and x < 10**precision`.
+        That is, the number must satisfy `not (x < 1) and x < 10**precision`.
+        Note, we care about the absolute value, so we don't use the sign bit.
+        """
+        significand = int(self.significand())
+        exponent = int(self.exponent())
+        def less_than_10_to_the(rhs_exp) -> bool:
+            lhs_sig = significand
+            lhs_exp = exponent
+            rhs_sig = 1
+            delta_exp = lhs_exp - rhs_exp
+            if delta_exp >= 0:
+                lhs_sig *= 10**delta_exp
+                lhs_exp -= delta_exp
+            else:
+                rhs_sig *= 10**(-delta_exp)
+                rhs_exp += delta_exp
+            return lhs_sig < rhs_sig
+        return not less_than_10_to_the(0) and less_than_10_to_the(BoostDecimalHelpers.precision(self.bit_width))
 
     def to_string(self) -> str:
-        return self.to_chars_scientific_impl()
+        if self.within_fractional_value():
+            return self.to_chars_fixed_impl()
+        else:
+            return self.to_chars_scientific_impl()
 
 def boost_decimal_build_pretty_printer():
     pp = gdb.printing.RegexpCollectionPrettyPrinter("boost_decimal")
